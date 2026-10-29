@@ -1,0 +1,4 @@
+-r ../../libs/common/requirements.txt
+
+motor==3.7.0
+pymongo==4.11.3

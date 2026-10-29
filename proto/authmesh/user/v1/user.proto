@@ -1,0 +1,137 @@
+// User/persistence contract served by the MongoDB-backed user-service.
+//
+// This service is internal-only: it is never exposed outside the cluster and it
+// deliberately traffics in raw credential material (password hashes, encrypted
+// TOTP secrets) so that the auth-service remains the single component that
+// knows how to interpret them.
+syntax = "proto3";
+
+package authmesh.user.v1;
+
+// ---------------------------------------------------------------------------
+// Core entities
+// ---------------------------------------------------------------------------
+
+message User {
+  string id = 1;
+  string email = 2;
+  string display_name = 3;
+  // bcrypt hash, never leaves the cluster.
+  string password_hash = 4;
+  repeated string roles = 5;
+  bool totp_enabled = 6;
+  // Fernet-encrypted TOTP shared secret (base32 plaintext when decrypted).
+  string totp_secret_enc = 7;
+  // bcrypt hashes of single-use recovery codes.
+  repeated string recovery_code_hashes = 8;
+  bool disabled = 9;
+  // RFC3339 UTC timestamps.
+  string created_at = 10;
+  string updated_at = 11;
+  string password_changed_at = 12;
+}
+
+message AuditEvent {
+  string id = 1;
+  // e.g. "user.registered", "auth.login.succeeded", "auth.token.reuse_detected"
+  string action = 2;
+  string user_id = 3;
+  string email = 4;
+  bool success = 5;
+  string ip = 6;
+  string user_agent = 7;
+  string request_id = 8;
+  string reason = 9;
+  string created_at = 10;
+  map<string, string> metadata = 11;
+}
+
+// ---------------------------------------------------------------------------
+// Requests / responses
+// ---------------------------------------------------------------------------
+
+message CreateUserRequest {
+  string email = 1;
+  string display_name = 2;
+  string password_hash = 3;
+  repeated string roles = 4;
+}
+
+message GetUserRequest {
+  // Exactly one of the two must be set.
+  oneof selector {
+    string id = 1;
+    string email = 2;
+  }
+}
+
+// Partial update. Only fields explicitly present are written, which lets the
+// auth-service flip a single flag without racing other writers.
+message UpdateUserRequest {
+  string id = 1;
+  optional string display_name = 2;
+  optional string password_hash = 3;
+  optional bool totp_enabled = 4;
+  optional string totp_secret_enc = 5;
+  optional bool disabled = 6;
+  optional bool clear_totp_secret = 7;
+  // Replaces the whole collection when present.
+  RoleList roles = 8;
+  RecoveryCodeList recovery_code_hashes = 9;
+  // Set password_changed_at to "now" (used on password rotation).
+  optional bool touch_password_changed_at = 10;
+}
+
+message RoleList {
+  repeated string values = 1;
+}
+
+message RecoveryCodeList {
+  repeated string values = 1;
+}
+
+message DeleteUserRequest {
+  string id = 1;
+}
+
+message ListUsersRequest {
+  int32 page_size = 1;
+  // Opaque cursor: the id of the last user from the previous page.
+  string page_token = 2;
+  string email_prefix = 3;
+}
+
+message ListUsersResponse {
+  repeated User users = 1;
+  string next_page_token = 2;
+  int64 total = 3;
+}
+
+message ListAuditEventsRequest {
+  string user_id = 1;
+  string action = 2;
+  int32 page_size = 3;
+  string page_token = 4;
+}
+
+message ListAuditEventsResponse {
+  repeated AuditEvent events = 1;
+  string next_page_token = 2;
+}
+
+message Empty {}
+
+// ---------------------------------------------------------------------------
+// Service
+// ---------------------------------------------------------------------------
+
+service UserService {
+  rpc CreateUser(CreateUserRequest) returns (User);
+  rpc GetUser(GetUserRequest) returns (User);
+  rpc UpdateUser(UpdateUserRequest) returns (User);
+  rpc DeleteUser(DeleteUserRequest) returns (Empty);
+  rpc ListUsers(ListUsersRequest) returns (ListUsersResponse);
+
+  rpc RecordAuditEvent(AuditEvent) returns (Empty);
+  rpc ListAuditEvents(ListAuditEventsRequest) returns (ListAuditEventsResponse);
+}

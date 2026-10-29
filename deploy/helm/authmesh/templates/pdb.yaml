@@ -1,0 +1,28 @@
+{{- /*
+Pod Disruption Budgets.
+
+These only constrain *voluntary* disruption (node drains, cluster upgrades). With
+minAvailable: 1 a drain cannot take the last replica of a component down, which is
+what keeps a node rotation from causing an auth outage.
+*/}}
+{{- range $component := (list "gateway" "auth" "user") }}
+{{- $cfg := index $.Values $component }}
+{{- if and $cfg.enabled $cfg.podDisruptionBudget.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "authmesh.componentName" (dict "ctx" $ "component" $component) }}
+  labels:
+    {{- include "authmesh.componentLabels" (dict "ctx" $ "component" $component) | nindent 4 }}
+spec:
+  {{- if $cfg.podDisruptionBudget.maxUnavailable }}
+  maxUnavailable: {{ $cfg.podDisruptionBudget.maxUnavailable }}
+  {{- else }}
+  minAvailable: {{ $cfg.podDisruptionBudget.minAvailable }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "authmesh.selectorLabels" (dict "ctx" $ "component" $component) | nindent 6 }}
+{{- end }}
+{{- end }}

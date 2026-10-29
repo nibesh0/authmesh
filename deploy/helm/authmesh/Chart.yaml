@@ -1,0 +1,26 @@
+apiVersion: v2
+name: authmesh
+description: |
+  Authentication platform: an HTTP/REST gateway in front of a gRPC auth-service
+  and a MongoDB-backed user-service, with Redis-backed sessions, autoscaling,
+  health probes and a centralized logging/metrics pipeline.
+type: application
+
+# Chart version is bumped for packaging changes; appVersion tracks the images.
+version: 0.1.0
+appVersion: "0.1.0"
+
+keywords:
+  - authentication
+  - jwt
+  - grpc
+  - microservices
+
+kubeVersion: ">=1.27.0-0"
+
+annotations:
+  category: Security
+  # Dependencies are intentionally not Bitnami subcharts: the bundled Mongo and
+  # Redis here are single-replica development instances, and a real deployment
+  # points at managed datastores via mongodb.externalUri / redis.externalUrl.
+  artifacthub.io/prerelease: "true"

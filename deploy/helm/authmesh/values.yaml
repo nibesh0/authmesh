@@ -1,0 +1,515 @@
+# Default values for the authmesh chart.
+#
+# These defaults target a real cluster: 2+ replicas, autoscaling on, network
+# policies on, and the bundled datastores enabled so a fresh install works.
+# Point mongodb.externalUri / redis.externalUrl at managed services and set
+# mongodb.enabled=false / redis.enabled=false for anything you page on.
+#
+# See values-dev.yaml for a single-node (kind) overlay.
+
+global:
+  # Prefix applied to image repositories that do not already contain a registry.
+  imageRegistry: ""
+  imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+# Propagated to every service as ENVIRONMENT/LOG_LEVEL/LOG_FORMAT.
+environment: production
+logLevel: INFO
+# json feeds the log pipeline; use console only when tailing by hand.
+logFormat: json
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+  # No component talks to the Kubernetes API.
+  automountServiceAccountToken: false
+
+# ---------------------------------------------------------------------------
+# Secrets
+#
+# Leave the values empty and the chart generates them on first install, then
+# reuses the existing Secret on upgrade (a regenerated JWT secret would sign
+# every user out). Supply `existingSecret` to manage them externally, e.g. with
+# External Secrets or Sealed Secrets.
+#
+# Required keys when using existingSecret:
+#   JWT_SECRET, TOTP_ENCRYPTION_KEY, RECOVERY_CODE_PEPPER
+# ---------------------------------------------------------------------------
+secrets:
+  existingSecret: ""
+  jwtSecret: ""
+  # Set during a rotation: tokens signed with the previous secret keep working
+  # until they expire. Remove it once the longest refresh TTL has elapsed.
+  jwtSecretPrevious: ""
+  # Must be a 32-byte key, base64 encoded (Fernet format).
+  totpEncryptionKey: ""
+  recoveryCodePepper: ""
+
+# ---------------------------------------------------------------------------
+# API gateway (public HTTP)
+# ---------------------------------------------------------------------------
+gateway:
+  enabled: true
+  replicaCount: 2
+
+  image:
+    repository: authmesh/gateway
+    tag: ""            # defaults to Chart.appVersion
+    pullPolicy: IfNotPresent
+
+  service:
+    type: ClusterIP
+    port: 8080
+    annotations: {}
+
+  ingress:
+    enabled: false
+    className: ""
+    annotations: {}
+    host: authmesh.example.com
+    path: /
+    pathType: Prefix
+    tls: []
+    #  - secretName: authmesh-tls
+    #    hosts: [authmesh.example.com]
+
+  config:
+    docsEnabled: true
+    # Number of proxies in front of the gateway. Behind a single ingress
+    # controller this is 1; leaving it at 0 makes the gateway ignore
+    # X-Forwarded-For, which is the safe default but attributes every request to
+    # the ingress pod's IP for rate limiting.
+    trustedProxyHops: 1
+    corsAllowOrigins: []
+    maxRequestBodyBytes: 65536
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      # No CPU limit on purpose: throttling the edge adds latency under exactly
+      # the load the HPA is trying to react to. Memory is limited because a leak
+      # should be killed, not allowed to evict neighbours.
+      memory: 256Mi
+
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+    targetMemoryUtilizationPercentage: 80
+    behavior:
+      scaleDown:
+        # Long window: scaling down eagerly after a spike causes flapping.
+        stabilizationWindowSeconds: 300
+        policies:
+          - type: Percent
+            value: 50
+            periodSeconds: 60
+      scaleUp:
+        stabilizationWindowSeconds: 0
+        policies:
+          - type: Percent
+            value: 100
+            periodSeconds: 30
+          - type: Pods
+            value: 4
+            periodSeconds: 30
+        selectPolicy: Max
+
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+
+  probes:
+    liveness:
+      initialDelaySeconds: 5
+      periodSeconds: 10
+      timeoutSeconds: 3
+      failureThreshold: 3
+    readiness:
+      initialDelaySeconds: 3
+      periodSeconds: 5
+      timeoutSeconds: 3
+      # Two consecutive failures pull the pod out of rotation quickly, and one
+      # success puts it back.
+      failureThreshold: 2
+      successThreshold: 1
+    startup:
+      periodSeconds: 3
+      failureThreshold: 20
+
+  # Must exceed the app's own drain (readiness flip + grace) or SIGKILL wins.
+  terminationGracePeriodSeconds: 40
+
+  podAnnotations: {}
+  podLabels: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  topologySpreadEnabled: true
+  extraEnv: []
+
+# ---------------------------------------------------------------------------
+# Auth service (internal gRPC)
+# ---------------------------------------------------------------------------
+auth:
+  enabled: true
+  replicaCount: 2
+
+  image:
+    repository: authmesh/auth-service
+    tag: ""
+    pullPolicy: IfNotPresent
+
+  service:
+    port: 50051
+    metricsPort: 9101
+    annotations: {}
+
+  config:
+    accessTokenTtlSeconds: 900          # 15 minutes
+    refreshTokenTtlSeconds: 1209600     # 14 days
+    sessionAbsoluteTtlSeconds: 2592000  # 30 days
+    mfaChallengeTtlSeconds: 300
+    maxSessionsPerUser: 10
+
+    # ~250ms per hash on a modern core. Raising this is the single most effective
+    # defence against offline cracking if the hashes ever leak; it also becomes
+    # the dominant cost of a login, so size CPU requests accordingly.
+    bcryptRounds: 12
+    passwordMinLength: 12
+    passwordRequireMixedCase: true
+    passwordRequireDigit: true
+    passwordRequireSymbol: false
+
+    rateLimitEnabled: true
+    loginRateLimitPerIp: 20
+    loginRateLimitPerAccount: 10
+    loginRateLimitWindowSeconds: 60
+    registerRateLimitPerIp: 5
+    registerRateLimitWindowSeconds: 300
+    refreshRateLimitPerSession: 60
+    mfaRateLimitPerAccount: 10
+
+    lockoutEnabled: true
+    lockoutThreshold: 5
+    lockoutWindowSeconds: 900
+    lockoutDurationSeconds: 900
+
+    totpIssuerName: authmesh
+    recoveryCodeCount: 10
+
+    jwtIssuer: authmesh
+    jwtAudience: authmesh-api
+
+  resources:
+    requests:
+      # bcrypt makes login CPU-bound; under-requesting here shows up as slow
+      # logins long before it shows up as CPU saturation on the node.
+      cpu: 250m
+      memory: 192Mi
+    limits:
+      memory: 512Mi
+
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 12
+    targetCPUUtilizationPercentage: 65
+    targetMemoryUtilizationPercentage: 80
+    behavior:
+      scaleDown:
+        stabilizationWindowSeconds: 300
+        policies:
+          - type: Percent
+            value: 50
+            periodSeconds: 60
+      scaleUp:
+        stabilizationWindowSeconds: 0
+        policies:
+          - type: Percent
+            value: 100
+            periodSeconds: 30
+        selectPolicy: Max
+
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+
+  probes:
+    liveness:
+      initialDelaySeconds: 5
+      periodSeconds: 10
+      timeoutSeconds: 3
+      failureThreshold: 3
+    readiness:
+      initialDelaySeconds: 3
+      periodSeconds: 5
+      timeoutSeconds: 3
+      failureThreshold: 2
+    startup:
+      periodSeconds: 3
+      failureThreshold: 20
+
+  terminationGracePeriodSeconds: 40
+
+  podAnnotations: {}
+  podLabels: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  topologySpreadEnabled: true
+  extraEnv: []
+
+# ---------------------------------------------------------------------------
+# User service (internal gRPC, MongoDB)
+# ---------------------------------------------------------------------------
+user:
+  enabled: true
+  replicaCount: 2
+
+  image:
+    repository: authmesh/user-service
+    tag: ""
+    pullPolicy: IfNotPresent
+
+  service:
+    port: 50052
+    metricsPort: 9102
+    annotations: {}
+
+  config:
+    auditRetentionDays: 90
+    defaultPageSize: 50
+    maxPageSize: 200
+    ensureIndexes: true
+    mongoServerSelectionTimeoutMs: 3000
+    mongoMaxPoolSize: 50
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 160Mi
+    limits:
+      memory: 384Mi
+
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 8
+    targetCPUUtilizationPercentage: 70
+    targetMemoryUtilizationPercentage: 80
+    behavior:
+      scaleDown:
+        stabilizationWindowSeconds: 300
+        policies:
+          - type: Percent
+            value: 50
+            periodSeconds: 60
+      scaleUp:
+        stabilizationWindowSeconds: 0
+        policies:
+          - type: Percent
+            value: 100
+            periodSeconds: 30
+        selectPolicy: Max
+
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+
+  probes:
+    liveness:
+      initialDelaySeconds: 5
+      periodSeconds: 10
+      timeoutSeconds: 3
+      failureThreshold: 3
+    readiness:
+      initialDelaySeconds: 3
+      periodSeconds: 5
+      timeoutSeconds: 3
+      failureThreshold: 2
+    startup:
+      periodSeconds: 3
+      failureThreshold: 20
+
+  terminationGracePeriodSeconds: 40
+
+  podAnnotations: {}
+  podLabels: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  topologySpreadEnabled: true
+  extraEnv: []
+
+# ---------------------------------------------------------------------------
+# Datastores
+#
+# Both bundled instances are single replicas with a PVC: fine for development
+# and demos, not for production. Disable them and point at managed services
+# (Atlas, ElastiCache, ...) for anything that matters.
+# ---------------------------------------------------------------------------
+mongodb:
+  enabled: true
+  externalUri: ""
+  database: authmesh
+  image:
+    repository: mongo
+    tag: "7.0.14"
+    pullPolicy: IfNotPresent
+  # Mongo's default 50% -of-RAM cache ignores the container limit; cap it.
+  wiredTigerCacheSizeGB: 0.5
+  persistence:
+    enabled: true
+    size: 4Gi
+    storageClass: ""
+  resources:
+    requests:
+      cpu: 100m
+      memory: 384Mi
+    limits:
+      memory: 1Gi
+
+redis:
+  enabled: true
+  externalUrl: ""
+  image:
+    repository: redis
+    tag: "7.4.2-alpine"
+    pullPolicy: IfNotPresent
+  # Every key the auth-service writes has a TTL, so evicting the least recently
+  # used *expiring* key is the correct policy under memory pressure.
+  maxmemory: 256mb
+  maxmemoryPolicy: volatile-lru
+  # AOF keeps sessions across a restart; without it a Redis restart signs
+  # everyone out.
+  appendonly: true
+  persistence:
+    enabled: true
+    size: 2Gi
+    storageClass: ""
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      memory: 320Mi
+
+# ---------------------------------------------------------------------------
+# Network policy
+#
+# Enforces the intended call graph: internet -> gateway -> auth -> user, and
+# nothing else. Note that kind's default CNI (kindnet) does not implement
+# NetworkPolicy, so these objects are created but not enforced there.
+# ---------------------------------------------------------------------------
+networkPolicy:
+  enabled: true
+  # Namespaces allowed to reach the gateway. Empty means any pod in the cluster.
+  ingressNamespaceSelectors: []
+  # Selector for the pods allowed to scrape the metrics ports.
+  monitoringNamespaceLabels:
+    kubernetes.io/metadata.name: monitoring
+
+# ---------------------------------------------------------------------------
+# Observability
+#
+# Two mutually compatible paths:
+#  * an existing prometheus-operator: enable serviceMonitor / podMonitor
+#  * no operator: enable the bundled prometheus + grafana (development scale)
+# Logs: fluentBit tails container stdout and ships to Loki. The services already
+# log structured JSON, so no parsing rules are needed beyond the JSON decoder.
+# ---------------------------------------------------------------------------
+observability:
+  serviceMonitor:
+    enabled: false
+    interval: 30s
+    scrapeTimeout: 10s
+    labels: {}
+
+  podMonitor:
+    enabled: false
+    interval: 30s
+    labels: {}
+
+  prometheusRule:
+    enabled: false
+    labels: {}
+
+  prometheus:
+    enabled: false
+    image:
+      repository: prom/prometheus
+      tag: "v3.1.0"
+    retention: 24h
+    scrapeInterval: 15s
+    service:
+      type: ClusterIP
+      port: 9090
+    persistence:
+      enabled: false
+      size: 8Gi
+      storageClass: ""
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        memory: 768Mi
+
+  grafana:
+    enabled: false
+    image:
+      repository: grafana/grafana
+      tag: "11.5.1"
+    adminUser: admin
+    # Generated on first install when empty.
+    adminPassword: ""
+    service:
+      type: ClusterIP
+      port: 3000
+    resources:
+      requests:
+        cpu: 50m
+        memory: 128Mi
+      limits:
+        memory: 384Mi
+
+  loki:
+    enabled: false
+    image:
+      repository: grafana/loki
+      tag: "3.4.1"
+    retentionHours: 72
+    service:
+      port: 3100
+    persistence:
+      enabled: false
+      size: 8Gi
+      storageClass: ""
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        memory: 768Mi
+
+  fluentBit:
+    enabled: false
+    image:
+      repository: fluent/fluent-bit
+      tag: "3.2.5"
+    resources:
+      requests:
+        cpu: 50m
+        memory: 96Mi
+      limits:
+        memory: 192Mi
+    # Where to ship. Defaults to the bundled Loki when it is enabled.
+    lokiHost: ""

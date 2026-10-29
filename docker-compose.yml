@@ -1,0 +1,173 @@
+# Local development stack: the three services plus their datastores, and an
+# optional Prometheus + Grafana pair behind the `observability` profile.
+#
+#   make dev-up                 # services only
+#   make dev-up-observability   # services + Prometheus + Grafana
+#
+# The topology mirrors the Kubernetes deployment: only the gateway publishes a
+# port, and the gRPC services are reachable only on the internal network.
+
+name: authmesh
+
+x-service-defaults: &service-defaults
+  restart: unless-stopped
+  # The processes handle SIGTERM and drain; give them room to finish.
+  stop_grace_period: 30s
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+x-common-env: &common-env
+  ENVIRONMENT: ${ENVIRONMENT:-development}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  LOG_FORMAT: ${LOG_FORMAT:-json}
+  VERSION: ${VERSION:-0.1.0}
+
+services:
+  mongo:
+    image: mongo:7.0.14
+    command:
+      - --wiredTigerCacheSizeGB=0.5
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    <<: *service-defaults
+
+  redis:
+    image: redis:7.4.2-alpine
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --maxmemory
+      - 256mb
+      # Sessions and rate-limit counters all carry TTLs; evicting the
+      # longest-idle expiring key is safer than evicting arbitrary keys.
+      - --maxmemory-policy
+      - volatile-lru
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    <<: *service-defaults
+
+  user-service:
+    build:
+      context: .
+      dockerfile: services/user/Dockerfile
+    image: authmesh/user-service:dev
+    environment:
+      <<: *common-env
+      SERVICE_NAME: authmesh-user
+      GRPC_PORT: "50052"
+      METRICS_PORT: "9102"
+      MONGO_URI: ${MONGO_URI:-mongodb://mongo:27017}
+      MONGO_DATABASE: ${MONGO_DATABASE:-authmesh}
+      AUDIT_RETENTION_DAYS: ${AUDIT_RETENTION_DAYS:-90}
+    depends_on:
+      mongo:
+        condition: service_healthy
+    <<: *service-defaults
+
+  auth-service:
+    build:
+      context: .
+      dockerfile: services/auth/Dockerfile
+    image: authmesh/auth-service:dev
+    environment:
+      <<: *common-env
+      SERVICE_NAME: authmesh-auth
+      GRPC_PORT: "50051"
+      METRICS_PORT: "9101"
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      USER_SERVICE_TARGET: ${USER_SERVICE_TARGET:-user-service:50052}
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required; copy .env.example to .env}
+      TOTP_ENCRYPTION_KEY: ${TOTP_ENCRYPTION_KEY:?TOTP_ENCRYPTION_KEY is required}
+      RECOVERY_CODE_PEPPER: ${RECOVERY_CODE_PEPPER:?RECOVERY_CODE_PEPPER is required}
+      ACCESS_TOKEN_TTL_SECONDS: ${ACCESS_TOKEN_TTL_SECONDS:-900}
+      REFRESH_TOKEN_TTL_SECONDS: ${REFRESH_TOKEN_TTL_SECONDS:-1209600}
+      SESSION_ABSOLUTE_TTL_SECONDS: ${SESSION_ABSOLUTE_TTL_SECONDS:-2592000}
+      BCRYPT_ROUNDS: ${BCRYPT_ROUNDS:-12}
+      PASSWORD_MIN_LENGTH: ${PASSWORD_MIN_LENGTH:-12}
+      RATE_LIMIT_ENABLED: ${RATE_LIMIT_ENABLED:-true}
+      LOGIN_RATE_LIMIT_PER_IP: ${LOGIN_RATE_LIMIT_PER_IP:-20}
+      LOGIN_RATE_LIMIT_PER_ACCOUNT: ${LOGIN_RATE_LIMIT_PER_ACCOUNT:-10}
+      LOGIN_RATE_LIMIT_WINDOW_SECONDS: ${LOGIN_RATE_LIMIT_WINDOW_SECONDS:-60}
+      REGISTER_RATE_LIMIT_PER_IP: ${REGISTER_RATE_LIMIT_PER_IP:-5}
+      REGISTER_RATE_LIMIT_WINDOW_SECONDS: ${REGISTER_RATE_LIMIT_WINDOW_SECONDS:-300}
+      LOCKOUT_ENABLED: ${LOCKOUT_ENABLED:-true}
+      LOCKOUT_THRESHOLD: ${LOCKOUT_THRESHOLD:-5}
+      LOCKOUT_DURATION_SECONDS: ${LOCKOUT_DURATION_SECONDS:-900}
+    depends_on:
+      redis:
+        condition: service_healthy
+      user-service:
+        condition: service_healthy
+    <<: *service-defaults
+
+  gateway:
+    build:
+      context: .
+      dockerfile: services/gateway/Dockerfile
+    image: authmesh/gateway:dev
+    environment:
+      <<: *common-env
+      SERVICE_NAME: authmesh-gateway
+      HTTP_PORT: "8080"
+      METRICS_PORT: "9100"
+      AUTH_SERVICE_TARGET: ${AUTH_SERVICE_TARGET:-auth-service:50051}
+      DOCS_ENABLED: ${DOCS_ENABLED:-true}
+      TRUSTED_PROXY_HOPS: ${TRUSTED_PROXY_HOPS:-0}
+    ports:
+      - "${GATEWAY_PORT:-8080}:8080"
+    depends_on:
+      auth-service:
+        condition: service_healthy
+    <<: *service-defaults
+
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    profiles: ["observability"]
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=6h
+      - --web.enable-lifecycle
+    volumes:
+      - ./deploy/observability/prometheus-compose.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    <<: *service-defaults
+
+  grafana:
+    image: grafana/grafana:11.5.1
+    profiles: ["observability"]
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+    volumes:
+      - ./deploy/observability/grafana-datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml:ro
+      - ./deploy/observability/grafana-dashboards.yml:/etc/grafana/provisioning/dashboards/dashboards.yml:ro
+      # The dashboard lives in the chart so Compose and Kubernetes render the
+      # same JSON from one source.
+      - ./deploy/helm/authmesh/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    depends_on:
+      - prometheus
+    <<: *service-defaults
+
+volumes:
+  mongo-data:
+  redis-data:

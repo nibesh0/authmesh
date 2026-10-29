@@ -1,0 +1,133 @@
+{{- if .Values.gateway.enabled }}
+{{- $component := "gateway" }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "authmesh.componentName" (dict "ctx" . "component" $component) }}
+  labels:
+    {{- include "authmesh.componentLabels" (dict "ctx" . "component" $component) | nindent 4 }}
+spec:
+  {{- if not .Values.gateway.autoscaling.enabled }}
+  replicas: {{ .Values.gateway.replicaCount }}
+  {{- end }}
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Never drop below the current capacity while rolling: the edge is what
+      # users hit directly.
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      {{- include "authmesh.selectorLabels" (dict "ctx" . "component" $component) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "authmesh.componentLabels" (dict "ctx" . "component" $component) | nindent 8 }}
+        {{- with .Values.gateway.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        # Roll the pods when the configuration they read changes.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- include "authmesh.scrapeAnnotations" (dict "port" .Values.gateway.service.port) | nindent 8 }}
+        {{- with .Values.gateway.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "authmesh.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- include "authmesh.podSecurityContext" . | nindent 8 }}
+      terminationGracePeriodSeconds: {{ .Values.gateway.terminationGracePeriodSeconds }}
+      {{- if .Values.gateway.topologySpreadEnabled }}
+      topologySpreadConstraints:
+        {{- include "authmesh.topologySpread" (dict "ctx" . "component" $component) | nindent 8 }}
+      {{- end }}
+      {{- with .Values.gateway.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.gateway.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.gateway.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: gateway
+          image: {{ include "authmesh.image" (dict "ctx" . "image" .Values.gateway.image) }}
+          imagePullPolicy: {{ .Values.gateway.image.pullPolicy }}
+          securityContext:
+            {{- include "authmesh.containerSecurityContext" . | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.gateway.service.port }}
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: {{ include "authmesh.fullname" . }}-common
+            - configMapRef:
+                name: {{ include "authmesh.componentName" (dict "ctx" . "component" $component) }}
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            {{- with .Values.gateway.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          # Liveness deliberately hits /healthz, which does not touch the
+          # auth-service: a downstream outage should drain this pod (readiness),
+          # not restart it.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: {{ .Values.gateway.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.gateway.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.gateway.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.gateway.probes.liveness.failureThreshold }}
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: {{ .Values.gateway.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.gateway.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.gateway.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.gateway.probes.readiness.failureThreshold }}
+            successThreshold: {{ .Values.gateway.probes.readiness.successThreshold }}
+          # Startup probe absorbs a slow first boot without forcing a long
+          # initialDelay on the liveness probe.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: {{ .Values.gateway.probes.startup.periodSeconds }}
+            failureThreshold: {{ .Values.gateway.probes.startup.failureThreshold }}
+          lifecycle:
+            preStop:
+              exec:
+                # uvicorn closes its listening socket the moment it gets SIGTERM,
+                # so the pause has to happen before the signal is delivered.
+                # Without it, requests routed just before the endpoint was removed
+                # are refused.
+                command: ["/bin/sleep", "5"]
+          resources:
+            {{- toYaml .Values.gateway.resources | nindent 12 }}
+          volumeMounts:
+            # Root filesystem is read-only; give the process a scratch dir.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 32Mi
+{{- end }}

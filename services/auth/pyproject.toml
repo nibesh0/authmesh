@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=75.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "authmesh-auth-service"
+version = "0.1.0"
+description = "JWT/TOTP authentication service with Redis-backed sessions (gRPC)."
+requires-python = ">=3.12"
+dependencies = [
+  "authmesh-common",
+  "PyJWT==2.10.1",
+  "bcrypt==4.3.0",
+  "pyotp==2.9.0",
+  "cryptography==44.0.2",
+  "redis==5.2.1",
+]
+
+[project.scripts]
+auth-service = "auth_service.main:run"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["auth_service*"]

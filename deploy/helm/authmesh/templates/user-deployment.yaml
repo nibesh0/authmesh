@@ -1,0 +1,118 @@
+{{- if .Values.user.enabled }}
+{{- $component := "user" }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "authmesh.componentName" (dict "ctx" . "component" $component) }}
+  labels:
+    {{- include "authmesh.componentLabels" (dict "ctx" . "component" $component) | nindent 4 }}
+spec:
+  {{- if not .Values.user.autoscaling.enabled }}
+  replicas: {{ .Values.user.replicaCount }}
+  {{- end }}
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      {{- include "authmesh.selectorLabels" (dict "ctx" . "component" $component) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "authmesh.componentLabels" (dict "ctx" . "component" $component) | nindent 8 }}
+        {{- with .Values.user.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- include "authmesh.scrapeAnnotations" (dict "port" .Values.user.service.metricsPort) | nindent 8 }}
+        {{- with .Values.user.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "authmesh.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- include "authmesh.podSecurityContext" . | nindent 8 }}
+      terminationGracePeriodSeconds: {{ .Values.user.terminationGracePeriodSeconds }}
+      {{- if .Values.user.topologySpreadEnabled }}
+      topologySpreadConstraints:
+        {{- include "authmesh.topologySpread" (dict "ctx" . "component" $component) | nindent 8 }}
+      {{- end }}
+      {{- with .Values.user.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.user.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.user.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: user
+          image: {{ include "authmesh.image" (dict "ctx" . "image" .Values.user.image) }}
+          imagePullPolicy: {{ .Values.user.image.pullPolicy }}
+          securityContext:
+            {{- include "authmesh.containerSecurityContext" . | nindent 12 }}
+          ports:
+            - name: grpc
+              containerPort: {{ .Values.user.service.port }}
+              protocol: TCP
+            - name: metrics
+              containerPort: {{ .Values.user.service.metricsPort }}
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: {{ include "authmesh.fullname" . }}-common
+            - configMapRef:
+                name: {{ include "authmesh.componentName" (dict "ctx" . "component" $component) }}
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            {{- with .Values.user.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          livenessProbe:
+            grpc:
+              port: {{ .Values.user.service.port }}
+            initialDelaySeconds: {{ .Values.user.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.user.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.user.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.user.probes.liveness.failureThreshold }}
+          # "ready" is gated on a successful Mongo ping, so a database failover
+          # drains these pods instead of surfacing errors to callers.
+          readinessProbe:
+            grpc:
+              port: {{ .Values.user.service.port }}
+              service: ready
+            initialDelaySeconds: {{ .Values.user.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.user.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.user.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.user.probes.readiness.failureThreshold }}
+          startupProbe:
+            grpc:
+              port: {{ .Values.user.service.port }}
+            periodSeconds: {{ .Values.user.probes.startup.periodSeconds }}
+            failureThreshold: {{ .Values.user.probes.startup.failureThreshold }}
+          resources:
+            {{- toYaml .Values.user.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 32Mi
+{{- end }}

@@ -1,0 +1,165 @@
+{{- /*
+prometheus-operator integration.
+
+Both objects are off by default because the CRDs may not exist; enabling them
+without prometheus-operator installed makes `helm install` fail with "no matches
+for kind ServiceMonitor". When there is no operator, use the bundled Prometheus
+(observability.prometheus.enabled) or the pod annotations, which every scrape
+config based on kubernetes_sd_configs already understands.
+*/}}
+{{- if .Values.observability.serviceMonitor.enabled }}
+{{- range $component := (list "auth" "user") }}
+{{- $cfg := index $.Values $component }}
+{{- if $cfg.enabled }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "authmesh.componentName" (dict "ctx" $ "component" $component) }}
+  labels:
+    {{- include "authmesh.componentLabels" (dict "ctx" $ "component" $component) | nindent 4 }}
+    {{- with $.Values.observability.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "authmesh.selectorLabels" (dict "ctx" $ "component" $component) | nindent 6 }}
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: {{ $.Values.observability.serviceMonitor.interval }}
+      scrapeTimeout: {{ $.Values.observability.serviceMonitor.scrapeTimeout }}
+{{- end }}
+{{- end }}
+{{- if .Values.gateway.enabled }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "authmesh.componentName" (dict "ctx" . "component" "gateway") }}
+  labels:
+    {{- include "authmesh.componentLabels" (dict "ctx" . "component" "gateway") | nindent 4 }}
+    {{- with .Values.observability.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "authmesh.selectorLabels" (dict "ctx" . "component" "gateway") | nindent 6 }}
+  endpoints:
+    # The gateway serves metrics from its main HTTP port, not a side port.
+    - port: http
+      path: /metrics
+      interval: {{ .Values.observability.serviceMonitor.interval }}
+      scrapeTimeout: {{ .Values.observability.serviceMonitor.scrapeTimeout }}
+{{- end }}
+{{- end }}
+{{- if .Values.observability.prometheusRule.enabled }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "authmesh.fullname" . }}
+  labels:
+    {{- include "authmesh.labels" . | nindent 4 }}
+    {{- with .Values.observability.prometheusRule.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: authmesh.availability
+      rules:
+        - alert: AuthmeshNoReadyReplicas
+          expr: sum by (job) (authmesh_ready) == 0
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "No ready replicas for {{`{{ $labels.job }}`}}"
+            description: >-
+              Every replica is reporting itself unready, which means a dependency
+              probe (Redis, MongoDB or a downstream service) is failing.
+
+        - alert: AuthmeshDependencyDown
+          expr: min by (dependency) (authmesh_dependency_up) == 0
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Dependency {{`{{ $labels.dependency }}`}} is unreachable"
+
+        - alert: AuthmeshHighServerErrorRate
+          expr: |
+            sum(rate(grpc_server_handled_total{grpc_code="INTERNAL"}[5m]))
+              / clamp_min(sum(rate(grpc_server_handled_total[5m])), 0.001) > 0.02
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "More than 2% of gRPC calls are failing with INTERNAL"
+
+        - alert: AuthmeshLoginLatencyHigh
+          expr: |
+            histogram_quantile(
+              0.95,
+              sum by (le) (rate(grpc_server_handling_seconds_bucket{grpc_method="Login"}[5m]))
+            ) > 1.5
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "p95 login latency above 1.5s"
+            description: >-
+              Logins are bcrypt-bound. Check CPU throttling and whether the HPA has
+              room to scale before lowering the cost factor.
+
+    - name: authmesh.security
+      rules:
+        # This should be flat at zero. A non-zero rate means refresh tokens are
+        # being replayed after rotation, i.e. a token has leaked.
+        - alert: AuthmeshRefreshTokenReuse
+          expr: increase(authmesh_token_reuse_detected_total[15m]) > 0
+          for: 0m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Refresh token reuse detected"
+            description: >-
+              A rotated refresh token was presented again and its session was
+              revoked. Investigate the affected user and source address in the
+              audit log.
+
+        - alert: AuthmeshCredentialStuffingSuspected
+          expr: |
+            sum(rate(authmesh_login_attempts_total{outcome=~"invalid_password|unknown_user"}[10m]))
+              > 5
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Sustained failed-login rate"
+            description: >-
+              More than 5 failed logins per second over 10 minutes. Check the
+              rate-limit and lockout counters before widening any limits.
+
+        - alert: AuthmeshLockoutSpike
+          expr: increase(authmesh_account_lockouts_total[15m]) > 20
+          for: 0m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Unusual number of account lockouts"
+
+        - alert: AuthmeshSessionStoreErrors
+          expr: increase(authmesh_store_errors_total[10m]) > 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Redis operations are failing"
+            description: >-
+              Session lookups fail closed (requests are rejected) while rate
+              limiting fails open (requests are allowed), so both availability and
+              abuse protection are degraded.
+{{- end }}

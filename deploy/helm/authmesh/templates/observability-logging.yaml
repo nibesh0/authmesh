@@ -1,0 +1,348 @@
+{{- /*
+Centralized logging: Fluent Bit tails container stdout on every node and ships to
+Loki, which Grafana queries alongside Prometheus.
+
+The application side of this is already done: all three services write single-line
+JSON to stdout with a `request_id`, so Fluent Bit only has to decode the JSON and
+attach Kubernetes metadata. No sidecars, no log files, no rotation to manage.
+
+Both pieces are optional. Point fluentBit.lokiHost at an existing Loki (or swap the
+output for Elasticsearch/CloudWatch) and leave loki.enabled off if the cluster
+already has a log backend.
+*/}}
+{{- $lokiName := include "authmesh.componentName" (dict "ctx" . "component" "loki") }}
+{{- if .Values.observability.loki.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $lokiName }}
+  labels:
+    {{- include "authmesh.componentLabels" (dict "ctx" . "component" "loki") | nindent 4 }}
+data:
+  loki.yaml: |
+    auth_enabled: false
+    server:
+      http_listen_port: {{ .Values.observability.loki.service.port }}
+      grpc_listen_port: 9095
+      log_level: warn
+    common:
+      instance_addr: 127.0.0.1
+      path_prefix: /loki
+      replication_factor: 1
+      ring:
+        kvstore:
+          store: inmemory
+      storage:
+        filesystem:
+          chunks_directory: /loki/chunks
+          rules_directory: /loki/rules
+    schema_config:
+      configs:
+        - from: 2024-01-01
+          store: tsdb
+          object_store: filesystem
+          schema: v13
+          index:
+            prefix: index_
+            period: 24h
+    limits_config:
+      # Kubernetes clocks and container log timestamps can be a little behind;
+      # rejecting slightly old lines would silently drop them.
+      reject_old_samples: true
+      reject_old_samples_max_age: 24h
+      retention_period: {{ .Values.observability.loki.retentionHours }}h
+      allow_structured_metadata: false
+    compactor:
+      working_directory: /loki/compactor
+      retention_enabled: true
+      delete_request_store: filesystem
+    analytics:
+      reporting_enabled: false
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $lokiName }}
+  labels:
+    {{- include "authmesh.componentLabels" (dict "ctx" . "component" "loki") | nindent 4 }}
+spec:
+  selector:
+    {{- include "authmesh.selectorLabels" (dict "ctx" . "component" "loki") | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.observability.loki.service.port }}
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $lokiName }}
+  labels:
+    {{- include "authmesh.componentLabels" (dict "ctx" . "component" "loki") | nindent 4 }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "authmesh.selectorLabels" (dict "ctx" . "component" "loki") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "authmesh.componentLabels" (dict "ctx" . "component" "loki") | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/observability-logging.yaml") . | sha256sum }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: loki
+          image: "{{ .Values.observability.loki.image.repository }}:{{ .Values.observability.loki.image.tag }}"
+          args:
+            - -config.file=/etc/loki/loki.yaml
+          ports:
+            - name: http
+              containerPort: {{ .Values.observability.loki.service.port }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            failureThreshold: 12
+          resources:
+            {{- toYaml .Values.observability.loki.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/loki
+            - name: data
+              mountPath: /loki
+      volumes:
+        - name: config
+          configMap:
+            name: {{ $lokiName }}
+        - name: data
+          {{- if .Values.observability.loki.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ $lokiName }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+{{- if .Values.observability.loki.persistence.enabled }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ $lokiName }}
+  labels:
+    {{- include "authmesh.componentLabels" (dict "ctx" . "component" "loki") | nindent 4 }}
+spec:
+  accessModes: ["ReadWriteOnce"]
+  {{- with .Values.observability.loki.persistence.storageClass }}
+  storageClassName: {{ . }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.observability.loki.persistence.size }}
+{{- end }}
+{{- end }}
+
+{{- if .Values.observability.fluentBit.enabled }}
+{{- $fbName := include "authmesh.componentName" (dict "ctx" . "component" "fluent-bit") }}
+{{- $lokiHost := .Values.observability.fluentBit.lokiHost | default (printf "%s:%d" $lokiName (int .Values.observability.loki.service.port)) }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $fbName }}
+  labels:
+    {{- include "authmesh.componentLabels" (dict "ctx" . "component" "fluent-bit") | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $fbName }}
+  labels:
+    {{- include "authmesh.componentLabels" (dict "ctx" . "component" "fluent-bit") | nindent 4 }}
+rules:
+  # Needed to turn a log file path into pod/namespace/container labels.
+  - apiGroups: [""]
+    resources: [pods, namespaces]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $fbName }}
+  labels:
+    {{- include "authmesh.componentLabels" (dict "ctx" . "component" "fluent-bit") | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ $fbName }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $fbName }}
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $fbName }}
+  labels:
+    {{- include "authmesh.componentLabels" (dict "ctx" . "component" "fluent-bit") | nindent 4 }}
+data:
+  fluent-bit.conf: |
+    [SERVICE]
+        Daemon              Off
+        Flush               5
+        Log_Level           warn
+        Parsers_File        parsers.conf
+        HTTP_Server         On
+        HTTP_Listen         0.0.0.0
+        HTTP_Port           2020
+        Health_Check        On
+
+    [INPUT]
+        Name                tail
+        Tag                 kube.*
+        Path                /var/log/containers/*.log
+        # Skip Fluent Bit's own output or it will feed on itself.
+        Exclude_Path        /var/log/containers/*fluent-bit*.log
+        multiline.parser    cri
+        Mem_Buf_Limit       16MB
+        Skip_Long_Lines     On
+        Refresh_Interval    10
+        DB                  /var/log/flb_kube.db
+
+    [FILTER]
+        Name                kubernetes
+        Match               kube.*
+        Kube_Tag_Prefix     kube.var.log.containers.
+        Merge_Log           Off
+        Keep_Log            On
+        Labels              On
+        Annotations         Off
+
+    # Only ship this release's logs; everything else on the node is noise here.
+    [FILTER]
+        Name                grep
+        Match               kube.*
+        Regex               $kubernetes['labels']['app.kubernetes.io/part-of'] authmesh
+
+    # The services already emit JSON, so parse it into real fields instead of
+    # shipping one opaque string. Structured queries in Grafana depend on this.
+    [FILTER]
+        Name                parser
+        Match               kube.*
+        Key_Name            log
+        Parser              authmesh_json
+        Reserve_Data        On
+
+    [OUTPUT]
+        Name                loki
+        Match               kube.*
+        Host                {{ (split ":" $lokiHost)._0 }}
+        Port                {{ (split ":" $lokiHost)._1 | default "3100" }}
+        # Stream labels stay low cardinality: pod name would create a stream per
+        # replica restart, so it travels as structured data instead.
+        Labels              job=authmesh, namespace=$kubernetes['namespace_name'], component=$kubernetes['labels']['app.kubernetes.io/component'], container=$kubernetes['container_name']
+        Label_Keys          $level
+        Remove_Keys         kubernetes,stream,_p
+        Line_Format         json
+        Auto_Kubernetes_Labels Off
+        Retry_Limit         5
+
+  parsers.conf: |
+    [PARSER]
+        Name        authmesh_json
+        Format      json
+        Time_Key    ts
+        Time_Format %Y-%m-%dT%H:%M:%S.%L%z
+        Time_Keep   On
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ $fbName }}
+  labels:
+    {{- include "authmesh.componentLabels" (dict "ctx" . "component" "fluent-bit") | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "authmesh.selectorLabels" (dict "ctx" . "component" "fluent-bit") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "authmesh.componentLabels" (dict "ctx" . "component" "fluent-bit") | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/observability-logging.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: {{ $fbName }}
+      # Reading /var/log/containers on the host needs root; the container drops
+      # every capability and cannot escalate, and both mounts are read-only
+      # except for the tail checkpoint database.
+      securityContext:
+        runAsUser: 0
+      tolerations:
+        # Ship logs from control-plane nodes too.
+        - operator: Exists
+          effect: NoSchedule
+        - operator: Exists
+          effect: NoExecute
+      containers:
+        - name: fluent-bit
+          image: "{{ .Values.observability.fluentBit.image.repository }}:{{ .Values.observability.fluentBit.image.tag }}"
+          ports:
+            - name: http
+              containerPort: 2020
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+              add: [DAC_READ_SEARCH]
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.observability.fluentBit.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /fluent-bit/etc/fluent-bit.conf
+              subPath: fluent-bit.conf
+            - name: config
+              mountPath: /fluent-bit/etc/parsers.conf
+              subPath: parsers.conf
+            - name: varlog
+              mountPath: /var/log
+            - name: containers
+              mountPath: /var/lib/docker/containers
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: {{ $fbName }}
+        - name: varlog
+          hostPath:
+            path: /var/log
+        - name: containers
+          hostPath:
+            path: /var/lib/docker/containers
+{{- end }}

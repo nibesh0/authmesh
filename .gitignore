@@ -1,0 +1,26 @@
+# secrets and local config
+.env
+.env.local
+*.pem
+*.key
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# generated protobuf stubs: reproduced by `make proto`
+libs/common/src/authmesh/
+
+# local run artefacts
+.logs/

@@ -1,0 +1,34 @@
+# Prometheus configuration for the Docker Compose stack. The Kubernetes
+# deployment uses service discovery instead (see the Helm chart).
+global:
+  scrape_interval: 15s
+  scrape_timeout: 10s
+  external_labels:
+    cluster: compose
+    environment: development
+
+scrape_configs:
+  - job_name: gateway
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["gateway:8080"]
+        labels:
+          service: authmesh-gateway
+
+  # The gRPC services cannot serve /metrics on their gRPC port, so each runs a
+  # small HTTP listener on a dedicated metrics port.
+  - job_name: auth-service
+    static_configs:
+      - targets: ["auth-service:9101"]
+        labels:
+          service: authmesh-auth
+
+  - job_name: user-service
+    static_configs:
+      - targets: ["user-service:9102"]
+        labels:
+          service: authmesh-user
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

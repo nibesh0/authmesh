@@ -1,0 +1,127 @@
+{{- /*
+`helm test authmesh -n authmesh` runs this pod.
+
+It is a real check, not a ping: it registers a user, logs in, calls an
+authenticated endpoint with the returned token, rotates the refresh token and then
+confirms that replaying the old one is rejected. That exercises the gateway, the
+auth-service, Redis and MongoDB in one pass, so a green `helm test` means the
+release actually works rather than merely that the pods started.
+*/}}
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ include "authmesh.fullname" . }}-test-connection
+  labels:
+    {{- include "authmesh.componentLabels" (dict "ctx" . "component" "test") | nindent 4 }}
+  annotations:
+    helm.sh/hook: test
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+    helm.sh/hook-weight: "1"
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    runAsGroup: 10001
+  containers:
+    - name: test
+      # Reuse the gateway image: it already has Python and needs no registry pull.
+      image: {{ include "authmesh.image" (dict "ctx" . "image" .Values.gateway.image) }}
+      imagePullPolicy: {{ .Values.gateway.image.pullPolicy }}
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: [ALL]
+      env:
+        - name: BASE_URL
+          value: "http://{{ include "authmesh.componentName" (dict "ctx" . "component" "gateway") }}:{{ .Values.gateway.service.port }}"
+      command: ["python", "-c"]
+      args:
+        - |
+          import json, os, sys, time, urllib.error, urllib.request, uuid
+
+          base = os.environ["BASE_URL"]
+          api = base + "/api/v1"
+          password = "Helm-Test-Passphrase-8821"
+          email = "helm-test-%s@example.com" % uuid.uuid4().hex[:12]
+
+          def call(method, url, payload=None, token=None):
+              data = json.dumps(payload).encode() if payload is not None else None
+              request = urllib.request.Request(url, data=data, method=method)
+              if data:
+                  request.add_header("content-type", "application/json")
+              if token:
+                  request.add_header("authorization", "Bearer " + token)
+              try:
+                  with urllib.request.urlopen(request, timeout=20) as response:
+                      body = response.read()
+                      return response.status, json.loads(body) if body else {}
+              except urllib.error.HTTPError as exc:
+                  body = exc.read()
+                  try:
+                      return exc.code, json.loads(body) if body else {}
+                  except json.JSONDecodeError:
+                      return exc.code, {}
+
+          failures = []
+
+          def check(label, condition, detail=""):
+              if condition:
+                  print("PASS " + label)
+              else:
+                  failures.append(label)
+                  print("FAIL " + label + " " + str(detail))
+
+          # Readiness first: the pods may still be rolling when the hook starts.
+          for _ in range(60):
+              try:
+                  status, _ = call("GET", base + "/readyz")
+                  if status == 200:
+                      break
+              except Exception:
+                  pass
+              time.sleep(2)
+          else:
+              print("FAIL gateway never became ready")
+              sys.exit(1)
+          print("PASS gateway is ready")
+
+          status, body = call("POST", api + "/auth/register",
+                              {"email": email, "password": password,
+                               "display_name": "Helm Test"})
+          check("register", status == 201, (status, body))
+
+          status, body = call("POST", api + "/auth/login",
+                              {"email": email, "password": password})
+          tokens = body.get("tokens") or {}
+          check("login returns tokens", status == 200 and bool(tokens.get("access_token")),
+                (status, body))
+
+          status, body = call("GET", api + "/me", token=tokens.get("access_token"))
+          check("authenticated request", status == 200 and body.get("email") == email,
+                (status, body))
+
+          status, rotated = call("POST", api + "/auth/refresh",
+                                 {"refresh_token": tokens.get("refresh_token", "")})
+          check("refresh rotates the token",
+                status == 200 and rotated.get("refresh_token") != tokens.get("refresh_token"),
+                (status, rotated))
+
+          status, body = call("POST", api + "/auth/refresh",
+                              {"refresh_token": tokens.get("refresh_token", "")})
+          check("replaying a rotated refresh token is rejected",
+                status == 401 and body.get("error", {}).get("code") == "token_reused",
+                (status, body))
+
+          status, body = call("POST", api + "/auth/login",
+                              {"email": email, "password": "wrong-password"})
+          check("bad credentials are rejected",
+                status == 401 and body.get("error", {}).get("code") == "invalid_credentials",
+                (status, body))
+
+          if failures:
+              print("%d check(s) failed: %s" % (len(failures), ", ".join(failures)))
+              sys.exit(1)
+          print("all checks passed")

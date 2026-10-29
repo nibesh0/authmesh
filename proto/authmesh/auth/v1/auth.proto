@@ -1,0 +1,227 @@
+// Authentication contract served by the auth-service and consumed by the
+// API gateway (and any other internal service that needs to validate a token).
+syntax = "proto3";
+
+package authmesh.auth.v1;
+
+// ---------------------------------------------------------------------------
+// Shared messages
+// ---------------------------------------------------------------------------
+
+// Caller metadata forwarded by the gateway. The auth-service uses it for rate
+// limiting, lockout accounting and the audit trail; it never trusts it for
+// authorization decisions.
+message CallerContext {
+  string ip = 1;
+  string user_agent = 2;
+}
+
+message TokenPair {
+  string access_token = 1;
+  string refresh_token = 2;
+  string token_type = 3;
+  // Seconds until the access token expires.
+  int64 expires_in = 4;
+  // Seconds until the refresh token expires.
+  int64 refresh_expires_in = 5;
+  string session_id = 6;
+}
+
+message UserProfile {
+  string id = 1;
+  string email = 2;
+  string display_name = 3;
+  repeated string roles = 4;
+  bool totp_enabled = 5;
+  bool disabled = 6;
+  string created_at = 7;
+  string updated_at = 8;
+}
+
+message Session {
+  string id = 1;
+  string created_at = 2;
+  string last_used_at = 3;
+  string expires_at = 4;
+  string ip = 5;
+  string user_agent = 6;
+  // True for the session the request was made with.
+  bool current = 7;
+}
+
+message Empty {}
+
+// ---------------------------------------------------------------------------
+// Registration / login
+// ---------------------------------------------------------------------------
+
+message RegisterRequest {
+  string email = 1;
+  string password = 2;
+  string display_name = 3;
+  CallerContext ctx = 4;
+}
+
+message RegisterResponse {
+  UserProfile user = 1;
+}
+
+message LoginRequest {
+  string email = 1;
+  string password = 2;
+  // Optional: supplying a valid code here completes 2FA in a single round trip.
+  string totp_code = 3;
+  CallerContext ctx = 4;
+}
+
+message LoginResponse {
+  // When true, `tokens` is empty and the caller must complete the challenge
+  // by calling VerifyMfa with `mfa_token`.
+  bool mfa_required = 1;
+  string mfa_token = 2;
+  TokenPair tokens = 3;
+  UserProfile user = 4;
+}
+
+message VerifyMfaRequest {
+  string mfa_token = 1;
+  // Either a 6-digit TOTP code or one of the user's recovery codes.
+  string code = 2;
+  CallerContext ctx = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Token lifecycle
+// ---------------------------------------------------------------------------
+
+message RefreshRequest {
+  string refresh_token = 1;
+  CallerContext ctx = 2;
+}
+
+message RefreshResponse {
+  TokenPair tokens = 1;
+}
+
+message LogoutRequest {
+  string refresh_token = 1;
+  // Optional: also denylists this access token for its remaining lifetime.
+  string access_token = 2;
+}
+
+message LogoutAllRequest {
+  string user_id = 1;
+  // Optional session to keep alive (usually the caller's own).
+  string except_session_id = 2;
+}
+
+message RevocationResponse {
+  int32 sessions_revoked = 1;
+}
+
+message IntrospectRequest {
+  string access_token = 1;
+}
+
+message IntrospectResponse {
+  bool active = 1;
+  string user_id = 2;
+  string email = 3;
+  repeated string roles = 4;
+  string session_id = 5;
+  string jti = 6;
+  // Unix seconds.
+  int64 issued_at = 7;
+  int64 expires_at = 8;
+  bool totp_enabled = 9;
+  // Populated when active == false.
+  string inactive_reason = 10;
+}
+
+// ---------------------------------------------------------------------------
+// Credentials / 2FA
+// ---------------------------------------------------------------------------
+
+message ChangePasswordRequest {
+  string user_id = 1;
+  string current_password = 2;
+  string new_password = 3;
+  // Default behaviour is to revoke every other session.
+  bool keep_other_sessions = 4;
+  string current_session_id = 5;
+  CallerContext ctx = 6;
+}
+
+message EnrollTotpRequest {
+  string user_id = 1;
+}
+
+message EnrollTotpResponse {
+  // Base32 shared secret; shown once, must be confirmed via ActivateTotp.
+  string secret = 1;
+  string otpauth_uri = 2;
+  repeated string recovery_codes = 3;
+}
+
+message ActivateTotpRequest {
+  string user_id = 1;
+  string totp_code = 2;
+}
+
+message DisableTotpRequest {
+  string user_id = 1;
+  // Re-authentication is required to remove a second factor.
+  string password = 2;
+}
+
+message TotpStatusResponse {
+  bool totp_enabled = 1;
+  int32 recovery_codes_remaining = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Sessions
+// ---------------------------------------------------------------------------
+
+message ListSessionsRequest {
+  string user_id = 1;
+  string current_session_id = 2;
+}
+
+message ListSessionsResponse {
+  repeated Session sessions = 1;
+}
+
+message RevokeSessionRequest {
+  string user_id = 1;
+  string session_id = 2;
+}
+
+message GetProfileRequest {
+  string user_id = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Service
+// ---------------------------------------------------------------------------
+
+service AuthService {
+  rpc Register(RegisterRequest) returns (RegisterResponse);
+  rpc Login(LoginRequest) returns (LoginResponse);
+  rpc VerifyMfa(VerifyMfaRequest) returns (LoginResponse);
+
+  rpc Refresh(RefreshRequest) returns (RefreshResponse);
+  rpc Logout(LogoutRequest) returns (RevocationResponse);
+  rpc LogoutAll(LogoutAllRequest) returns (RevocationResponse);
+  rpc Introspect(IntrospectRequest) returns (IntrospectResponse);
+
+  rpc GetProfile(GetProfileRequest) returns (UserProfile);
+  rpc ChangePassword(ChangePasswordRequest) returns (RevocationResponse);
+
+  rpc EnrollTotp(EnrollTotpRequest) returns (EnrollTotpResponse);
+  rpc ActivateTotp(ActivateTotpRequest) returns (TotpStatusResponse);
+  rpc DisableTotp(DisableTotpRequest) returns (TotpStatusResponse);
+
+  rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
+  rpc RevokeSession(RevokeSessionRequest) returns (RevocationResponse);
+}

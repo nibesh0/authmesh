@@ -1,0 +1,39 @@
+{{- if and .Values.gateway.enabled .Values.gateway.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "authmesh.componentName" (dict "ctx" . "component" "gateway") }}
+  labels:
+    {{- include "authmesh.componentLabels" (dict "ctx" . "component" "gateway") | nindent 4 }}
+  {{- with .Values.gateway.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.gateway.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- with .Values.gateway.ingress.tls }}
+  tls:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  rules:
+    - host: {{ required "gateway.ingress.host is required when the ingress is enabled" .Values.gateway.ingress.host | quote }}
+      http:
+        paths:
+          - path: {{ .Values.gateway.ingress.path }}
+            pathType: {{ .Values.gateway.ingress.pathType }}
+            backend:
+              service:
+                name: {{ include "authmesh.componentName" (dict "ctx" . "component" "gateway") }}
+                port:
+                  number: {{ .Values.gateway.service.port }}
+{{- end }}
+{{- if and .Values.gateway.ingress.enabled (eq (int .Values.gateway.config.trustedProxyHops) 0) }}
+{{- /*
+Guard rail: an ingress terminates the client connection, so with 0 trusted hops
+every request looks like it came from the ingress controller and per-IP rate
+limiting collapses into a single global bucket.
+*/}}
+{{- fail "gateway.config.trustedProxyHops must be >= 1 when the ingress is enabled, otherwise per-IP rate limiting sees only the ingress controller's address" }}
+{{- end }}

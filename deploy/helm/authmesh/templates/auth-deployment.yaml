@@ -1,0 +1,122 @@
+{{- if .Values.auth.enabled }}
+{{- $component := "auth" }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "authmesh.componentName" (dict "ctx" . "component" $component) }}
+  labels:
+    {{- include "authmesh.componentLabels" (dict "ctx" . "component" $component) | nindent 4 }}
+spec:
+  {{- if not .Values.auth.autoscaling.enabled }}
+  replicas: {{ .Values.auth.replicaCount }}
+  {{- end }}
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      {{- include "authmesh.selectorLabels" (dict "ctx" . "component" $component) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "authmesh.componentLabels" (dict "ctx" . "component" $component) | nindent 8 }}
+        {{- with .Values.auth.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- include "authmesh.scrapeAnnotations" (dict "port" .Values.auth.service.metricsPort) | nindent 8 }}
+        {{- with .Values.auth.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "authmesh.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- include "authmesh.podSecurityContext" . | nindent 8 }}
+      terminationGracePeriodSeconds: {{ .Values.auth.terminationGracePeriodSeconds }}
+      {{- if .Values.auth.topologySpreadEnabled }}
+      topologySpreadConstraints:
+        {{- include "authmesh.topologySpread" (dict "ctx" . "component" $component) | nindent 8 }}
+      {{- end }}
+      {{- with .Values.auth.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.auth.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.auth.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: auth
+          image: {{ include "authmesh.image" (dict "ctx" . "image" .Values.auth.image) }}
+          imagePullPolicy: {{ .Values.auth.image.pullPolicy }}
+          securityContext:
+            {{- include "authmesh.containerSecurityContext" . | nindent 12 }}
+          ports:
+            - name: grpc
+              containerPort: {{ .Values.auth.service.port }}
+              protocol: TCP
+            - name: metrics
+              containerPort: {{ .Values.auth.service.metricsPort }}
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: {{ include "authmesh.fullname" . }}-common
+            - configMapRef:
+                name: {{ include "authmesh.componentName" (dict "ctx" . "component" $component) }}
+            # JWT_SECRET, TOTP_ENCRYPTION_KEY, RECOVERY_CODE_PEPPER
+            - secretRef:
+                name: {{ include "authmesh.secretName" . }}
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            {{- with .Values.auth.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          # Native gRPC probes against grpc.health.v1. The empty service name is
+          # the process-level liveness signal; "ready" additionally requires Redis
+          # and the user-service to be reachable.
+          livenessProbe:
+            grpc:
+              port: {{ .Values.auth.service.port }}
+            initialDelaySeconds: {{ .Values.auth.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.auth.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.auth.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.auth.probes.liveness.failureThreshold }}
+          readinessProbe:
+            grpc:
+              port: {{ .Values.auth.service.port }}
+              service: ready
+            initialDelaySeconds: {{ .Values.auth.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.auth.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.auth.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.auth.probes.readiness.failureThreshold }}
+          startupProbe:
+            grpc:
+              port: {{ .Values.auth.service.port }}
+            periodSeconds: {{ .Values.auth.probes.startup.periodSeconds }}
+            failureThreshold: {{ .Values.auth.probes.startup.failureThreshold }}
+          resources:
+            {{- toYaml .Values.auth.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 32Mi
+{{- end }}

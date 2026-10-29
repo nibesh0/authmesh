@@ -1,0 +1,49 @@
+# Tooling configuration for the whole repository. The services are packaged
+# individually (see services/*/pyproject.toml); this file only configures the
+# linter, formatter and test runner.
+
+[tool.ruff]
+line-length = 95
+target-version = "py312"
+extend-exclude = [
+  "libs/common/src/authmesh",  # generated protobuf stubs
+]
+
+[tool.ruff.lint]
+select = [
+  "E",    # pycodestyle
+  "F",    # pyflakes
+  "I",    # import sorting
+  "B",    # bugbear
+  "UP",   # pyupgrade
+  "N",    # naming
+  "SIM",  # simplification
+  "RUF",
+]
+ignore = [
+  "B008",  # FastAPI's Depends() in defaults is the documented pattern
+  "E501",  # long lines are reported by the formatter instead
+]
+
+[tool.ruff.lint.per-file-ignores]
+# gRPC servicer methods must keep their PascalCase names.
+"services/*/src/*/servicer.py" = ["N802"]
+"tests/*" = ["N802", "B011"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+asyncio_mode = "auto"
+# Pinned explicitly: pytest-asyncio warns when it is unset and will change the
+# default in a future release.
+asyncio_default_fixture_loop_scope = "function"
+addopts = "-ra --strict-markers --strict-config"
+markers = [
+  "integration: needs the Docker Compose stack running (deselect with -m 'not integration')",
+]
+filterwarnings = [
+  "ignore::DeprecationWarning:motor.*",
+]

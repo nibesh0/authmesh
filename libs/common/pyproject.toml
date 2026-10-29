@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=75.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "authmesh-common"
+version = "0.1.0"
+description = "Shared runtime for the authmesh platform: config, logging, metrics, gRPC plumbing and generated stubs."
+requires-python = ">=3.12"
+dependencies = [
+  "grpcio==1.71.0",
+  "grpcio-health-checking==1.71.0",
+  "grpcio-reflection==1.71.0",
+  "protobuf==5.29.3",
+  "prometheus-client==0.21.1",
+  "pydantic==2.11.3",
+  "pydantic-settings==2.8.1",
+]
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["authmesh_common*", "authmesh*"]

@@ -1,0 +1,87 @@
+{{- /*
+Services for the three components.
+
+The gRPC services are declared headless (clusterIP: None). A normal ClusterIP is
+implemented by kube-proxy at L4, which pins a long-lived HTTP/2 connection to one
+backend pod for its whole lifetime; every request from a given caller would then
+land on the same replica and autoscaling would achieve nothing. Headless gives the
+client all pod IPs so grpc's round_robin policy can balance individual calls.
+*/}}
+{{- if .Values.gateway.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "authmesh.componentName" (dict "ctx" . "component" "gateway") }}
+  labels:
+    {{- include "authmesh.componentLabels" (dict "ctx" . "component" "gateway") | nindent 4 }}
+  {{- with .Values.gateway.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.gateway.service.type }}
+  selector:
+    {{- include "authmesh.selectorLabels" (dict "ctx" . "component" "gateway") | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.gateway.service.port }}
+      targetPort: http
+      protocol: TCP
+{{- end }}
+---
+{{- if .Values.auth.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "authmesh.componentName" (dict "ctx" . "component" "auth") }}
+  labels:
+    {{- include "authmesh.componentLabels" (dict "ctx" . "component" "auth") | nindent 4 }}
+  {{- with .Values.auth.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  clusterIP: None
+  # Include pods that are not yet ready in DNS so a client's resolver learns
+  # about a new replica as soon as it exists; grpc's health-aware picker still
+  # avoids sending it traffic until it is ready.
+  publishNotReadyAddresses: false
+  selector:
+    {{- include "authmesh.selectorLabels" (dict "ctx" . "component" "auth") | nindent 4 }}
+  ports:
+    - name: grpc
+      port: {{ .Values.auth.service.port }}
+      targetPort: grpc
+      protocol: TCP
+    - name: metrics
+      port: {{ .Values.auth.service.metricsPort }}
+      targetPort: metrics
+      protocol: TCP
+{{- end }}
+---
+{{- if .Values.user.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "authmesh.componentName" (dict "ctx" . "component" "user") }}
+  labels:
+    {{- include "authmesh.componentLabels" (dict "ctx" . "component" "user") | nindent 4 }}
+  {{- with .Values.user.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: false
+  selector:
+    {{- include "authmesh.selectorLabels" (dict "ctx" . "component" "user") | nindent 4 }}
+  ports:
+    - name: grpc
+      port: {{ .Values.user.service.port }}
+      targetPort: grpc
+      protocol: TCP
+    - name: metrics
+      port: {{ .Values.user.service.metricsPort }}
+      targetPort: metrics
+      protocol: TCP
+{{- end }}

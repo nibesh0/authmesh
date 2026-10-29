@@ -1,0 +1,204 @@
+{{- if .Values.observability.prometheus.enabled }}
+{{- $component := "prometheus" }}
+{{- $name := include "authmesh.componentName" (dict "ctx" . "component" $component) }}
+{{- /*
+A small bundled Prometheus for clusters without prometheus-operator (kind, demos,
+a single-tenant environment). It discovers targets from pod annotations, which the
+three Deployments already carry, so adding a replica or a new component needs no
+scrape-config change.
+
+For anything long-lived, run a real Prometheus and use the ServiceMonitor objects
+instead: this one has a short retention and no HA.
+*/}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "authmesh.componentLabels" (dict "ctx" . "component" $component) | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "authmesh.componentLabels" (dict "ctx" . "component" $component) | nindent 4 }}
+rules:
+  # Namespace-scoped on purpose: this Prometheus only scrapes this release.
+  - apiGroups: [""]
+    resources: [pods, services, endpoints]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "authmesh.componentLabels" (dict "ctx" . "component" $component) | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "authmesh.componentLabels" (dict "ctx" . "component" $component) | nindent 4 }}
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: {{ .Values.observability.prometheus.scrapeInterval }}
+      external_labels:
+        cluster: {{ .Release.Name }}
+        environment: {{ .Values.environment }}
+
+    scrape_configs:
+      - job_name: authmesh-pods
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names: [{{ .Release.Namespace }}]
+        relabel_configs:
+          # Only pods that opt in via prometheus.io/scrape.
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: "true"
+          # Rewrite the target port to the annotated metrics port.
+          - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+            action: replace
+            regex: '([^:]+)(?::\d+)?;(\d+)'
+            replacement: '$1:$2'
+            target_label: __address__
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+            action: replace
+            target_label: __metrics_path__
+            regex: (.+)
+          # Carry the labels the dashboard groups by.
+          - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_component]
+            action: replace
+            target_label: component
+          - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_component]
+            action: replace
+            target_label: job
+          - source_labels: [__meta_kubernetes_pod_name]
+            action: replace
+            target_label: pod
+          - source_labels: [__meta_kubernetes_namespace]
+            action: replace
+            target_label: namespace
+
+      - job_name: prometheus
+        static_configs:
+          - targets: ["localhost:9090"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "authmesh.componentLabels" (dict "ctx" . "component" $component) | nindent 4 }}
+spec:
+  type: {{ .Values.observability.prometheus.service.type }}
+  selector:
+    {{- include "authmesh.selectorLabels" (dict "ctx" . "component" $component) | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.observability.prometheus.service.port }}
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "authmesh.componentLabels" (dict "ctx" . "component" $component) | nindent 4 }}
+spec:
+  replicas: 1
+  strategy:
+    # Single instance with a volume: replace rather than surge.
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "authmesh.selectorLabels" (dict "ctx" . "component" $component) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "authmesh.componentLabels" (dict "ctx" . "component" $component) | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/observability-prometheus.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: {{ $name }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
+      containers:
+        - name: prometheus
+          image: "{{ .Values.observability.prometheus.image.repository }}:{{ .Values.observability.prometheus.image.tag }}"
+          args:
+            - --config.file=/etc/prometheus/prometheus.yml
+            - --storage.tsdb.path=/prometheus
+            - --storage.tsdb.retention.time={{ .Values.observability.prometheus.retention }}
+            - --web.enable-lifecycle
+          ports:
+            - name: http
+              containerPort: 9090
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          readinessProbe:
+            httpGet:
+              path: /-/ready
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /-/healthy
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            {{- toYaml .Values.observability.prometheus.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/prometheus
+            - name: data
+              mountPath: /prometheus
+      volumes:
+        - name: config
+          configMap:
+            name: {{ $name }}
+        - name: data
+          {{- if .Values.observability.prometheus.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ $name }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+{{- if .Values.observability.prometheus.persistence.enabled }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "authmesh.componentLabels" (dict "ctx" . "component" $component) | nindent 4 }}
+spec:
+  accessModes: ["ReadWriteOnce"]
+  {{- with .Values.observability.prometheus.persistence.storageClass }}
+  storageClassName: {{ . }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.observability.prometheus.persistence.size }}
+{{- end }}
+{{- end }}

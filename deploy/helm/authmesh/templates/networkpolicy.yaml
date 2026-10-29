@@ -1,0 +1,219 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- /*
+Enforces the intended call graph:
+
+    ingress/clients -> gateway -> auth -> user -> mongodb
+                                  auth -> redis
+
+Anything else is denied. In particular the user-service, which handles password
+hashes and encrypted TOTP secrets, accepts connections only from the auth-service:
+a compromised gateway cannot read the credential store directly.
+
+Egress is left open apart from being explicitly required for DNS, because these
+services also need to reach the Kubernetes DNS service and (in some clusters) an
+external datastore. Tighten it per environment if you have a policy for that.
+
+Caveat: NetworkPolicy is enforced by the CNI plugin. kind's default (kindnet) does
+not implement it, so on kind these objects exist but nothing enforces them. Use a
+policy-capable CNI (Calico, Cilium) to see them take effect.
+*/}}
+{{- $fullname := include "authmesh.fullname" . }}
+{{- if .Values.gateway.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "authmesh.componentName" (dict "ctx" . "component" "gateway") }}
+  labels:
+    {{- include "authmesh.componentLabels" (dict "ctx" . "component" "gateway") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "authmesh.selectorLabels" (dict "ctx" . "component" "gateway") | nindent 6 }}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    # HTTP from anywhere the cluster allows (ingress controller, or any namespace
+    # when no selector is configured). This is the public edge.
+    - ports:
+        - port: http
+          protocol: TCP
+      {{- with .Values.networkPolicy.ingressNamespaceSelectors }}
+      from:
+        {{- range . }}
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml . | nindent 14 }}
+        {{- end }}
+      {{- end }}
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "authmesh.selectorLabels" (dict "ctx" . "component" "auth") | nindent 14 }}
+      ports:
+        - port: grpc
+          protocol: TCP
+    # CoreDNS. Without this the gateway cannot resolve the auth service name.
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+{{- end }}
+---
+{{- if .Values.auth.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "authmesh.componentName" (dict "ctx" . "component" "auth") }}
+  labels:
+    {{- include "authmesh.componentLabels" (dict "ctx" . "component" "auth") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "authmesh.selectorLabels" (dict "ctx" . "component" "auth") | nindent 6 }}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "authmesh.selectorLabels" (dict "ctx" . "component" "gateway") | nindent 14 }}
+      ports:
+        - port: grpc
+          protocol: TCP
+    # Metrics scraping from the monitoring namespace.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.monitoringNamespaceLabels | nindent 14 }}
+        - podSelector:
+            matchLabels:
+              {{- include "authmesh.selectorLabels" (dict "ctx" . "component" "prometheus") | nindent 14 }}
+      ports:
+        - port: metrics
+          protocol: TCP
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "authmesh.selectorLabels" (dict "ctx" . "component" "user") | nindent 14 }}
+      ports:
+        - port: grpc
+          protocol: TCP
+    {{- if .Values.redis.enabled }}
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "authmesh.selectorLabels" (dict "ctx" . "component" "redis") | nindent 14 }}
+      ports:
+        - port: 6379
+          protocol: TCP
+    {{- else }}
+    # External Redis: destination is outside the cluster, so the port is all we
+    # can constrain here.
+    - ports:
+        - port: 6379
+          protocol: TCP
+    {{- end }}
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+{{- end }}
+---
+{{- if .Values.user.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "authmesh.componentName" (dict "ctx" . "component" "user") }}
+  labels:
+    {{- include "authmesh.componentLabels" (dict "ctx" . "component" "user") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "authmesh.selectorLabels" (dict "ctx" . "component" "user") | nindent 6 }}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    # Only the auth-service. Nothing else has any business reading credentials.
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "authmesh.selectorLabels" (dict "ctx" . "component" "auth") | nindent 14 }}
+      ports:
+        - port: grpc
+          protocol: TCP
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.monitoringNamespaceLabels | nindent 14 }}
+        - podSelector:
+            matchLabels:
+              {{- include "authmesh.selectorLabels" (dict "ctx" . "component" "prometheus") | nindent 14 }}
+      ports:
+        - port: metrics
+          protocol: TCP
+  egress:
+    {{- if .Values.mongodb.enabled }}
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "authmesh.selectorLabels" (dict "ctx" . "component" "mongodb") | nindent 14 }}
+      ports:
+        - port: 27017
+          protocol: TCP
+    {{- else }}
+    - ports:
+        - port: 27017
+          protocol: TCP
+    {{- end }}
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+{{- end }}
+---
+{{- if .Values.mongodb.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "authmesh.componentName" (dict "ctx" . "component" "mongodb") }}
+  labels:
+    {{- include "authmesh.componentLabels" (dict "ctx" . "component" "mongodb") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "authmesh.selectorLabels" (dict "ctx" . "component" "mongodb") | nindent 6 }}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "authmesh.selectorLabels" (dict "ctx" . "component" "user") | nindent 14 }}
+      ports:
+        - port: 27017
+          protocol: TCP
+{{- end }}
+---
+{{- if .Values.redis.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "authmesh.componentName" (dict "ctx" . "component" "redis") }}
+  labels:
+    {{- include "authmesh.componentLabels" (dict "ctx" . "component" "redis") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "authmesh.selectorLabels" (dict "ctx" . "component" "redis") | nindent 6 }}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "authmesh.selectorLabels" (dict "ctx" . "component" "auth") | nindent 14 }}
+      ports:
+        - port: 6379
+          protocol: TCP
+{{- end }}
+{{- end }}

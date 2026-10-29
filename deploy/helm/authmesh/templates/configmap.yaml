@@ -1,0 +1,111 @@
+{{- /*
+One ConfigMap per component plus a shared one. Splitting them means a change to
+a gateway setting only rolls the gateway: the checksum annotations on each
+Deployment reference just the maps that component consumes.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "authmesh.fullname" . }}-common
+  labels:
+    {{- include "authmesh.labels" . | nindent 4 }}
+data:
+  ENVIRONMENT: {{ .Values.environment | quote }}
+  LOG_LEVEL: {{ .Values.logLevel | quote }}
+  LOG_FORMAT: {{ .Values.logFormat | quote }}
+  VERSION: {{ .Chart.AppVersion | quote }}
+  # Grace must stay under terminationGracePeriodSeconds or the kubelet SIGKILLs
+  # the process mid-drain.
+  SHUTDOWN_GRACE_SECONDS: "15"
+  HEALTH_CHECK_INTERVAL_SECONDS: "10"
+---
+{{- if .Values.gateway.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "authmesh.componentName" (dict "ctx" . "component" "gateway") }}
+  labels:
+    {{- include "authmesh.componentLabels" (dict "ctx" . "component" "gateway") | nindent 4 }}
+data:
+  SERVICE_NAME: authmesh-gateway
+  HTTP_PORT: {{ .Values.gateway.service.port | quote }}
+  AUTH_SERVICE_TARGET: {{ include "authmesh.authTarget" . | quote }}
+  DOCS_ENABLED: {{ .Values.gateway.config.docsEnabled | quote }}
+  TRUSTED_PROXY_HOPS: {{ .Values.gateway.config.trustedProxyHops | quote }}
+  MAX_REQUEST_BODY_BYTES: {{ .Values.gateway.config.maxRequestBodyBytes | quote }}
+  {{- if .Values.gateway.config.corsAllowOrigins }}
+  # pydantic-settings parses a JSON array for list-typed fields.
+  CORS_ALLOW_ORIGINS: {{ .Values.gateway.config.corsAllowOrigins | toJson | quote }}
+  {{- end }}
+  # The gateway serves /metrics from its own app; METRICS_ENABLED would start a
+  # second, redundant listener.
+  METRICS_ENABLED: "false"
+{{- end }}
+---
+{{- if .Values.auth.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "authmesh.componentName" (dict "ctx" . "component" "auth") }}
+  labels:
+    {{- include "authmesh.componentLabels" (dict "ctx" . "component" "auth") | nindent 4 }}
+data:
+  SERVICE_NAME: authmesh-auth
+  GRPC_PORT: {{ .Values.auth.service.port | quote }}
+  METRICS_PORT: {{ .Values.auth.service.metricsPort | quote }}
+  USER_SERVICE_TARGET: {{ include "authmesh.userTarget" . | quote }}
+  REDIS_URL: {{ include "authmesh.redisUrl" . | quote }}
+
+  ACCESS_TOKEN_TTL_SECONDS: {{ .Values.auth.config.accessTokenTtlSeconds | quote }}
+  REFRESH_TOKEN_TTL_SECONDS: {{ .Values.auth.config.refreshTokenTtlSeconds | quote }}
+  SESSION_ABSOLUTE_TTL_SECONDS: {{ .Values.auth.config.sessionAbsoluteTtlSeconds | quote }}
+  MFA_CHALLENGE_TTL_SECONDS: {{ .Values.auth.config.mfaChallengeTtlSeconds | quote }}
+  MAX_SESSIONS_PER_USER: {{ .Values.auth.config.maxSessionsPerUser | quote }}
+
+  JWT_ISSUER: {{ .Values.auth.config.jwtIssuer | quote }}
+  JWT_AUDIENCE: {{ .Values.auth.config.jwtAudience | quote }}
+
+  BCRYPT_ROUNDS: {{ .Values.auth.config.bcryptRounds | quote }}
+  PASSWORD_MIN_LENGTH: {{ .Values.auth.config.passwordMinLength | quote }}
+  PASSWORD_REQUIRE_MIXED_CASE: {{ .Values.auth.config.passwordRequireMixedCase | quote }}
+  PASSWORD_REQUIRE_DIGIT: {{ .Values.auth.config.passwordRequireDigit | quote }}
+  PASSWORD_REQUIRE_SYMBOL: {{ .Values.auth.config.passwordRequireSymbol | quote }}
+
+  RATE_LIMIT_ENABLED: {{ .Values.auth.config.rateLimitEnabled | quote }}
+  LOGIN_RATE_LIMIT_PER_IP: {{ .Values.auth.config.loginRateLimitPerIp | quote }}
+  LOGIN_RATE_LIMIT_PER_ACCOUNT: {{ .Values.auth.config.loginRateLimitPerAccount | quote }}
+  LOGIN_RATE_LIMIT_WINDOW_SECONDS: {{ .Values.auth.config.loginRateLimitWindowSeconds | quote }}
+  REGISTER_RATE_LIMIT_PER_IP: {{ .Values.auth.config.registerRateLimitPerIp | quote }}
+  REGISTER_RATE_LIMIT_WINDOW_SECONDS: {{ .Values.auth.config.registerRateLimitWindowSeconds | quote }}
+  REFRESH_RATE_LIMIT_PER_SESSION: {{ .Values.auth.config.refreshRateLimitPerSession | quote }}
+  MFA_RATE_LIMIT_PER_ACCOUNT: {{ .Values.auth.config.mfaRateLimitPerAccount | quote }}
+
+  LOCKOUT_ENABLED: {{ .Values.auth.config.lockoutEnabled | quote }}
+  LOCKOUT_THRESHOLD: {{ .Values.auth.config.lockoutThreshold | quote }}
+  LOCKOUT_WINDOW_SECONDS: {{ .Values.auth.config.lockoutWindowSeconds | quote }}
+  LOCKOUT_DURATION_SECONDS: {{ .Values.auth.config.lockoutDurationSeconds | quote }}
+
+  TOTP_ISSUER_NAME: {{ .Values.auth.config.totpIssuerName | quote }}
+  RECOVERY_CODE_COUNT: {{ .Values.auth.config.recoveryCodeCount | quote }}
+{{- end }}
+---
+{{- if .Values.user.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "authmesh.componentName" (dict "ctx" . "component" "user") }}
+  labels:
+    {{- include "authmesh.componentLabels" (dict "ctx" . "component" "user") | nindent 4 }}
+data:
+  SERVICE_NAME: authmesh-user
+  GRPC_PORT: {{ .Values.user.service.port | quote }}
+  METRICS_PORT: {{ .Values.user.service.metricsPort | quote }}
+  MONGO_URI: {{ include "authmesh.mongoUri" . | quote }}
+  MONGO_DATABASE: {{ .Values.mongodb.database | quote }}
+  MONGO_SERVER_SELECTION_TIMEOUT_MS: {{ .Values.user.config.mongoServerSelectionTimeoutMs | quote }}
+  MONGO_MAX_POOL_SIZE: {{ .Values.user.config.mongoMaxPoolSize | quote }}
+  AUDIT_RETENTION_DAYS: {{ .Values.user.config.auditRetentionDays | quote }}
+  DEFAULT_PAGE_SIZE: {{ .Values.user.config.defaultPageSize | quote }}
+  MAX_PAGE_SIZE: {{ .Values.user.config.maxPageSize | quote }}
+  ENSURE_INDEXES: {{ .Values.user.config.ensureIndexes | quote }}
+{{- end }}

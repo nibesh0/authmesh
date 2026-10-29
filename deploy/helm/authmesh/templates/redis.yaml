@@ -1,0 +1,115 @@
+{{- if .Values.redis.enabled }}
+{{- $component := "redis" }}
+{{- $name := include "authmesh.componentName" (dict "ctx" . "component" $component) }}
+{{- /*
+Single-replica Redis for development and demos.
+
+Redis holds sessions, refresh-token state and the rate-limit counters. Losing it
+signs everyone out (they can log in again) but does not lose user data, since
+accounts live in MongoDB. AOF is enabled so a pod restart does not do that.
+
+For production, replace with a managed instance (redis.enabled=false plus
+redis.externalUrl) that has replication and a real durability story.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "authmesh.componentLabels" (dict "ctx" . "component" $component) | nindent 4 }}
+spec:
+  clusterIP: None
+  selector:
+    {{- include "authmesh.selectorLabels" (dict "ctx" . "component" $component) | nindent 4 }}
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "authmesh.componentLabels" (dict "ctx" . "component" $component) | nindent 4 }}
+spec:
+  serviceName: {{ $name }}
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "authmesh.selectorLabels" (dict "ctx" . "component" $component) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "authmesh.componentLabels" (dict "ctx" . "component" $component) | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: redis
+          image: "{{ .Values.redis.image.repository }}:{{ .Values.redis.image.tag }}"
+          imagePullPolicy: {{ .Values.redis.image.pullPolicy }}
+          args:
+            - redis-server
+            - --appendonly
+            - {{ ternary "yes" "no" .Values.redis.appendonly | quote }}
+            - --maxmemory
+            - {{ .Values.redis.maxmemory | quote }}
+            # volatile-lru: every key written by the auth-service has a TTL, so
+            # eviction under pressure should target the stalest expiring key
+            # rather than risk dropping something without one.
+            - --maxmemory-policy
+            - {{ .Values.redis.maxmemoryPolicy | quote }}
+            - --save
+            - ""
+          ports:
+            - name: redis
+              containerPort: 6379
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          livenessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 4
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.redis.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      {{- if not .Values.redis.persistence.enabled }}
+      volumes:
+        - name: data
+          emptyDir: {}
+      {{- end }}
+  {{- if .Values.redis.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with .Values.redis.persistence.storageClass }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.redis.persistence.size }}
+  {{- end }}
+{{- end }}

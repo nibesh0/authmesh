@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=75.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "authmesh-gateway"
+version = "0.1.0"
+description = "HTTP/REST gateway translating public requests into internal gRPC calls."
+requires-python = ">=3.12"
+dependencies = [
+  "authmesh-common",
+  "fastapi==0.115.12",
+  "uvicorn[standard]==0.34.2",
+  "email-validator==2.2.0",
+]
+
+[project.scripts]
+gateway = "gateway.main:run"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["gateway*"]
